@@ -48,8 +48,7 @@ def run_code():
             user_code=data["code"],
             libraries=data["libraries"],
             tests=data["tests"],
-            script_parameters=data["script_parameters"],
-            cleanup=False
+            script_parameters=data["script_parameters"]
         )
         logging.info("Результат выполнения: %s", result["status"])
 
