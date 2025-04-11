@@ -1,0 +1,67 @@
+#include <tunables/global>
+
+profile docker_run_tests_profile flags=(attach_disconnected) {
+
+  # Разрешаем запуск и чтение Python
+  /usr/bin/python3 ix,
+  /usr/local/bin/python3 ix,
+  /usr/bin/env ix,
+
+  # Разрешаем системные библиотеки (для Python)
+  /lib/** rm,
+  /usr/lib/** rm,
+  /usr/local/lib/** rm,
+  /bin/** rm,
+  /usr/** rm,
+
+  # Разрешаем pip и установку пакетов
+  /usr/local/bin/pip3 ix,
+  /usr/bin/pip3 ix,
+  /usr/local/lib/** rw,
+  /tmp/** rwk,
+  /root/.cache/** rwk,
+
+  # Разрешаем чтение информации о дистрибутиве
+  /etc/debian_version r,
+  /etc/lsb-release r,
+  /etc/os-release r,
+  /etc/hostname r,
+  /etc/hosts r,
+  /etc/nsswitch.conf r,
+
+  # Разрешаем работу с сетью (для установки пакетов)
+  network inet,
+  network inet6,
+  network unix,
+
+  # Разрешаем доступ к /dev/null и /dev/urandom
+  /dev/null rw,
+  /dev/urandom r,
+  /dev/tty rw,
+
+  # Разрешаем чтение и выполнение файлов пользователя
+  /home/** rix,
+  /home/test/** rix,
+  
+  # Разрешаем доступ к монтируемой директории /mnt/app
+  /mnt/app/** rix,  # Монтируемая директория контейнера
+
+  # Разрешаем сигналы (нужны для container.kill и т.п.)
+  signal,
+
+  # Разрешаем базовые файловые операции
+  file,
+  umount,
+
+  # Запрещаем критические директории
+  deny /etc/shadow r,
+  deny /root/** rwklx,
+  deny /proc/** rwklx,
+  deny /sys/** rwklx,
+  deny /var/** rwklx,
+
+  # Запрещаем использование su и sudo
+  deny /bin/su x,
+  deny /usr/bin/sudo x,
+}
+
