@@ -75,6 +75,8 @@ Content-Type: application/json
 
 ```bash
 .
+├── app armor profile
+    └── docker_run_tests_profile # Профиль AppArmor
 ├── app.py              # Flask API
 ├── DockerCodeRunner.py # Основная логика запуска кода в Docker
 ├── requirements.txt
@@ -85,3 +87,19 @@ Content-Type: application/json
 
 Код исполняется в изолированном контейнере, и удаляется после выполнения. Однако всё равно не стоит запускать произвольные входные данные в продакшене без дополнительных проверок.
 
+## Активация профиля AppArmor (для Linux)
+
+Чтобы активировать профиль, который лежит в папке /app armor profile, нужно:
+1. Добавить файл docker_run_tests_profile в папку на хосте /etc/apparmor.d/
+2. Активировать профиль:
+
+```bash
+sudo apparmor_parser -r /etc/apparmor.d/docker_run_tests_profile
+```
+
+3. Проверить, что профиль активировался:
+
+```bash
+sudo aa-status | grep docker_run_tests_profile
+```
+Должно вывести название профиля.
