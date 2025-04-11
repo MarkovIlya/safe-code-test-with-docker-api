@@ -29,7 +29,7 @@ pip install -r requirements.txt
 3. Запусти API:
 
 ```bash
-python main.py
+python main.py или python3 main.py
 ```
 
 ## Пример запроса
