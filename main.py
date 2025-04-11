@@ -44,11 +44,12 @@ def run_code():
 
         logging.info("Запуск DockerCodeRunner с библиотеками: %s", data["libraries"])
         result = runner.run(
-            image_name="python:3.9",
+            image_name="python:3.11",
             user_code=data["code"],
             libraries=data["libraries"],
             tests=data["tests"],
-            script_parameters=data["script_parameters"]
+            script_parameters=data["script_parameters"],
+            cleanup=False
         )
         logging.info("Результат выполнения: %s", result["status"])
 

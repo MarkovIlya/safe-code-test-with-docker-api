@@ -1,5 +1,7 @@
 import docker
 import tempfile
+import tarfile
+import io
 import os
 import shutil
 import logging
@@ -12,8 +14,12 @@ class DockerCodeRunner:
     def run(self, image_name, user_code, libraries, tests, script_parameters, cleanup=True):
         self.logger.info("Запуск контейнера с образом: %s", image_name)
 
+        # Создаем временную директорию на хосте
         temp_dir = tempfile.mkdtemp()
         self.logger.debug("Создана временная директория: %s", temp_dir)
+
+        # Путь, который будем монтировать в контейнер
+        container_dir = '/mnt/app'
 
         try:
             # Сохраняем script.py
@@ -34,14 +40,24 @@ class DockerCodeRunner:
             container = self.client.containers.run(
                 image=image_name,
                 command="sleep infinity",
-                volumes={temp_dir: {'bind': '/app', 'mode': 'rw'}},
-                working_dir="/app",
-                detach=True
+                detach=True,
+                security_opt=["apparmor=docker_run_tests_profile"]
             )
             self.logger.info("Контейнер запущен: %s", container.id)
 
+            # Проверяем, существует ли директория и создаём её при необходимости
+            exec_result = container.exec_run("ls /mnt/app")
+            if exec_result.exit_code != 0:
+                self.logger.info("Директория /mnt/app не найдена, создаем её")
+                container.exec_run("mkdir -p /mnt/app")
+
+            # Копируем файлы из временной директории в контейнер
+            self.logger.info("Копирование файлов в контейнер...")
+            tar_data = self._create_tar_from_directory(temp_dir)
+            self.client.containers.get(container.id).put_archive(container_dir, tar_data)
+            
             try:
-                # Установка библиотек
+                # Установка библиотек, если они есть
                 install_output = "No libraries to install"
                 if libraries:
                     pip_cmd = f"pip install {' '.join(libraries)}"
@@ -54,7 +70,7 @@ class DockerCodeRunner:
 
                 # Запуск тестов
                 self.logger.info("Запуск тестов в контейнере...")
-                exit_code, output = container.exec_run("python3 -m unittest test_script.py")
+                exit_code, output = container.exec_run("env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover /mnt/app")
                 test_output = output.decode().strip()
                 self.logger.debug("Результаты тестов:\n%s", test_output)
 
@@ -78,6 +94,14 @@ class DockerCodeRunner:
         finally:
             shutil.rmtree(temp_dir)
             self.logger.debug("Удалена временная директория: %s", temp_dir)
+
+    def _create_tar_from_directory(self, src_dir):
+        """Создаёт архив в формате tar из директории"""
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+            tar.add(src_dir, arcname=".")
+        tar_stream.seek(0)
+        return tar_stream
 
     def _generate_script(self, user_code, libraries, script_params):
         imports = "\n".join(f"import {lib}" for lib in libraries)
