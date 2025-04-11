@@ -17,15 +17,13 @@
 1. Клонируй репозиторий:
 
 ```bash
-git clone https://github.com/yourname/docker-code-runner.git
-cd docker-code-runner
+git clone git@github.com:MarkovIlya/safe-code-test-with-docker-api.git
 ```
 
 2. Установи зависимости:
 
 ```bash
-git clone https://github.com/yourname/docker-code-runner.git
-cd docker-code-runner
+pip install -r requirements.txt
 ```
 
 3. Запусти API:
