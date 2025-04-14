@@ -70,6 +70,9 @@ Content-Type: application/json
 - Python 3.8+
 - Docker установлен и работает
 - Права на запуск контейнеров (добавь себя в группу docker, если на Linux)
+- Чтобы использовать AppArmor нужно разворачивать проект на полноценном дистрибутиве Linux (либо виртуальная машина, либо на хосте) P.S. WSL2 не подойдет
+- Если хотите использовать на Windows, то удалите строчку по следующей ссылке:
+https://github.com/MarkovIlya/safe-code-test-with-docker-api/blob/45204154148085066a14149bb62c040299a9112a/DockerCodeRunner.py#L44C17-L44C67
 
 ## Структура проекта
 
