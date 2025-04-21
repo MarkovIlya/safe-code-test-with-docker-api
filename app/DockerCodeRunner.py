@@ -45,7 +45,7 @@ class DockerCodeRunner:
                 image=image_name,
                 command="sleep infinity",
                 detach=True,
-                # security_opt=["apparmor=docker_run_tests_profile"] # Нужно для использования профиля AppArmor в Linux
+                security_opt=["apparmor=docker_run_tests_profile"] # Нужно для использования профиля AppArmor в Linux
             )
             self.logger.info("Контейнер запущен: %s", container.id)
 
@@ -130,6 +130,7 @@ class DockerCodeRunner:
 
         raise Exception(f"Функция с именем '{function_name}' не найдена в коде участника.")
 
+    # TODO: Сделать проверку на импорт посторонних модулей
     def _generate_script(self, user_code, libraries):
         imports = "\n".join(f"import {lib}" for lib in libraries)
         return f"{imports}\n\n{user_code.strip()}\n"

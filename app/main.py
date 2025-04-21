@@ -50,7 +50,7 @@ def run_code():
             tests=data["tests"],
             script_name=data["script_name"],
             script_parameters=data["script_parameters"],
-            cleanup=False
+            # cleanup=False
         )
         logging.info("Результат выполнения: %s", result["status"])
 
