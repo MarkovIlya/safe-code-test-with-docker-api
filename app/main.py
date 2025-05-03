@@ -1,7 +1,10 @@
 import logging
 import os
 from flask import Flask, request, jsonify
-from DockerCodeRunner import DockerCodeRunner
+from docker_runner.DockerCodeRunner import DockerCodeRunner
+from concurrent.futures import ThreadPoolExecutor
+
+# Запуск через gunicorn app.main:app -c gunicorn.conf.py
 
 # ─── Настройка логирования ─────────────────────────────────────────────
 if not os.path.exists("logs"):
@@ -16,9 +19,10 @@ logging.basicConfig(
     ]
 )
 
-# ─── Flask App ─────────────────────────────────────────────────────────
+# ─── Flask App и Executor ─────────────────────────────────────────────────────────
 app = Flask(__name__)
 runner = DockerCodeRunner()
+executor = ThreadPoolExecutor(max_workers=8)  # Пул для параллельных задач
 
 @app.route("/run", methods=["POST"])
 def run_code():
@@ -43,15 +47,20 @@ def run_code():
             return jsonify({"error": "Only Python is supported"}), 400
 
         logging.info("Запуск DockerCodeRunner с библиотеками: %s", data["libraries"])
-        result = runner.run(
+        
+        # Запуск в отдельном потоке
+        future = executor.submit(
+            runner.run,
             image_name="python:3.11",
             user_code=data["code"],
             libraries=data["libraries"],
             tests=data["tests"],
             script_name=data["script_name"],
-            script_parameters=data["script_parameters"],
-            # cleanup=False
+            script_parameters=data["script_parameters"]
         )
+
+        result = future.result()
+
         logging.info("Результат выполнения: %s", result["status"])
 
         return jsonify(result)
