@@ -161,23 +161,26 @@ class DockerCodeRunner:
             "import unittest",
             "import json",
             "import traceback",
+            "import sys",
+            "import os",
             "from script import *",
             "",
             "class ScriptTestCase(unittest.TestCase):"
         ]
 
-        for test in tests:
+        for idx, test in enumerate(tests):  # Используем индекс для генерации id, если оно отсутствует
             params = ", ".join(repr(p) for p in test["parameters"])
             expected = repr(test["results"][0])
 
-            # Используем id и name из JSON для каждого теста
-            test_id = test.get("id")  # Получаем id теста
-            test_name = test.get("name", f"test_case_{test_id}")  # Используем name, если оно передано
+            # Если id нет, генерируем его на основе индекса
+            test_id = test.get("id", f"test_{idx+1}")  # Генерация id, если отсутствует
 
             lines.extend([
                 f"    def test_case_{test_id}(self):",  # Название теста, включая id
+                "        sys.stdout = open(os.devnull, 'w')",  # Перенаправляем вывод
                 f"        result = {script_name}({params})",
-                f"        self.assertEqual(result, {expected})"
+                f"        self.assertEqual(result, {expected})",  # Закрываем строку с assertEqual
+                "        sys.stdout = sys.__stdout__",  # Восстанавливаем стандартный вывод
             ])
 
         lines.extend([
@@ -198,18 +201,18 @@ class DockerCodeRunner:
             "    output = []",
             "    for test in result.successes:",
             "        try:",
-            "            # Проверяем формат имени метода и безопасно извлекаем id и name",
-            "            test_method_parts = test._testMethodName.split('_')",
-            "            test_id = test_method_parts[2]  # Получаем id из имени метода",
-            "            test_name = test_method_parts[3] if len(test_method_parts) > 3 else f'test_case_{test_id}'  # Получаем name, если он есть",
+            "            # Пытаемся извлечь id и name из имени метода",
+            "            test_method_name = test._testMethodName",
+            "            test_id = test_method_name.split('_')[-1]  # Получаем id, последний элемент после последнего \"_\"",
+            "            test_name = f'test_case_{test_id}'  # Имя теста формируется по id",
             "            output.append({'id': test_id, 'name': test_name, 'status': 'success'})",
             "        except IndexError as e:",
             "            output.append({'status': 'error', 'error': f'Ошибка при извлечении id или name: {str(e)}'})",
             "    for test, err in result.failures + result.errors:",
             "        try:",
-            "            test_method_parts = test._testMethodName.split('_')",
-            "            test_id = test_method_parts[2]  # Получаем id из имени метода",
-            "            test_name = test_method_parts[3] if len(test_method_parts) > 3 else f'test_case_{test_id}'",
+            "            test_method_name = test._testMethodName",
+            "            test_id = test_method_name.split('_')[-1]  # Получаем id, последний элемент после последнего \"_\"",
+            "            test_name = f'test_case_{test_id}'  # Имя теста формируется по id",
             "            output.append({'id': test_id, 'name': test_name, 'status': 'fail', 'error': err})",
             "        except IndexError as e:",
             "            output.append({'status': 'error', 'error': f'Ошибка при извлечении id или name: {str(e)}'})",
@@ -217,6 +220,7 @@ class DockerCodeRunner:
         ])
 
         return "\n".join(lines)
+
 
 
 

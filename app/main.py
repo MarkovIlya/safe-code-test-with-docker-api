@@ -2,6 +2,7 @@ import logging
 import os
 from flask import Flask, request, jsonify
 from docker_runner.DockerCodeRunner import DockerCodeRunner
+from docker_runner.static_analyzer import analyze_code  # Импортируем статический анализатор
 from concurrent.futures import ThreadPoolExecutor
 
 # ─── Настройка логирования ─────────────────────────────────────────────
@@ -43,6 +44,18 @@ def run_code():
         if language != "python":
             logging.warning("Неподдерживаемый язык: %s", language)
             return jsonify({"error": "Only Python is supported"}), 400
+
+        logging.info("Запуск статического анализа для кода участника...")
+        
+        # Статический анализ перед запуском
+        issues = analyze_code(data["code"])
+        if issues:
+            logging.warning("Статический анализ не прошёл: %s", issues)
+            return jsonify({
+                "status": "error",
+                "message": "Статический анализ не прошёл",
+                "issues": issues
+            }), 400
 
         logging.info("Запуск DockerCodeRunner с библиотеками: %s", data["libraries"])
         
