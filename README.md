@@ -100,6 +100,7 @@ Content-Type: application/json
 ├── app armor profile
     └── docker_run_tests_profile # Профиль AppArmor
 ├── docker_runner
+    ├── static_analyzer.py       # Статический анализатор кода участника 
     └── DockerCodeRunner.py      # Основная логика запуска кода в Docker
 ├── .gitignore 
 ├── gunicorn.conf.py             # Конфиг gunicorn
