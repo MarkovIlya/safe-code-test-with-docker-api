@@ -4,8 +4,6 @@ from flask import Flask, request, jsonify
 from docker_runner.DockerCodeRunner import DockerCodeRunner
 from concurrent.futures import ThreadPoolExecutor
 
-# Запуск через gunicorn app.main:app -c gunicorn.conf.py
-
 # ─── Настройка логирования ─────────────────────────────────────────────
 if not os.path.exists("logs"):
     os.makedirs("logs")
