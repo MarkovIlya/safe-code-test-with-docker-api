@@ -25,13 +25,13 @@ class DockerCodeRunner:
 
         try:
             script_path = os.path.join(temp_dir, "script.py")
-            with open(script_path, "w") as f:
+            with open(script_path, "w", encoding="utf-8") as f:
                 script_code = self._generate_script(user_code, libraries)
                 f.write(script_code)
             self.logger.debug("Сохранён script.py:\n%s", script_code)
 
             test_path = os.path.join(temp_dir, "test_script.py")
-            with open(test_path, "w") as f:
+            with open(test_path, "w", encoding="utf-8") as f:
                 test_code = self._generate_tests(tests, script_name)
                 f.write(test_code)
             self.logger.debug("Сохранён test_script.py:\n%s", test_code)
@@ -40,7 +40,7 @@ class DockerCodeRunner:
                 image=image_name,
                 command="sleep infinity",
                 detach=True,
-                security_opt=["apparmor=docker_run_tests_profile"]
+                # security_opt=["apparmor=docker_run_tests_profile"]
             )
             self.logger.info("Контейнер запущен: %s", container.id)
 
@@ -64,21 +64,27 @@ class DockerCodeRunner:
                         raise Exception(f"Ошибка установки библиотек:\n{install_output}")
 
                 self.logger.info("Запуск тестов в контейнере...")
-                exit_code, output = container.exec_run("python3 /mnt/app/test_script.py")
-                test_output = output.decode().strip()
-                self.logger.debug("Результаты тестов:\n%s", test_output)
+                exit_code, output = container.exec_run("python3 /mnt/app/test_script.py", demux=True)
+                stdout, stderr = output
 
-                if not test_output:
-                    self.logger.error("Ошибка: вывод тестов пустой!")
+                stdout = (stdout or b"").decode().strip()
+                stderr = (stderr or b"").decode().strip()
+
+                self.logger.debug("STDOUT тестов:\n%s", stdout)
+                self.logger.debug("STDERR тестов:\n%s", stderr)
+
+                if not stdout:
+                    self.logger.error("Ошибка: stdout тестов пустой!")
                     return {
                         "status": "fail",
                         "error": "Вывод тестов пустой",
-                        "raw_output": test_output
+                        "raw_output": stdout,
+                        "stderr": stderr
                     }
 
                 try:
                     # Пробуем разобрать вывод как JSON
-                    test_statuses = json.loads(test_output)
+                    test_statuses = json.loads(stdout)
 
                     # Проверяем, что JSON содержит список словарей с полями 'id', 'name', 'status'
                     if not isinstance(test_statuses, list) or not all(
@@ -93,7 +99,7 @@ class DockerCodeRunner:
                     return {
                         "status": status,
                         "install_output": install_output,
-                        "test_output": test_output,
+                        "test_output": stdout,
                         "test_statuses": test_statuses
                     }
 
@@ -102,7 +108,7 @@ class DockerCodeRunner:
                     return {
                         "status": "fail",
                         "error": f"Невозможно разобрать JSON: {str(e)}",
-                        "raw_output": test_output
+                        "raw_output": stdout
                     }
 
                 except ValueError as e:
@@ -110,7 +116,7 @@ class DockerCodeRunner:
                     return {
                         "status": "fail",
                         "error": str(e),
-                        "raw_output": test_output
+                        "raw_output": stdout
                     }
 
 
@@ -160,7 +166,6 @@ class DockerCodeRunner:
         lines = [
             "import unittest",
             "import json",
-            "import traceback",
             "import sys",
             "import os",
             "from script import *",
@@ -168,19 +173,17 @@ class DockerCodeRunner:
             "class ScriptTestCase(unittest.TestCase):"
         ]
 
-        for idx, test in enumerate(tests):  # Используем индекс для генерации id, если оно отсутствует
+        for idx, test in enumerate(tests):
             params = ", ".join(repr(p) for p in test["parameters"])
             expected = repr(test["results"][0])
-
-            # Если id нет, генерируем его на основе индекса
-            test_id = test.get("id", f"test_{idx+1}")  # Генерация id, если отсутствует
+            test_id = test.get("id", f"test_{idx+1}")
 
             lines.extend([
-                f"    def test_case_{test_id}(self):",  # Название теста, включая id
-                "        sys.stdout = open(os.devnull, 'w')",  # Перенаправляем вывод
+                f"    def test_case_{test_id}(self):",
+                "        sys.stdout = open(os.devnull, 'w')",
                 f"        result = {script_name}({params})",
-                f"        self.assertEqual(result, {expected})",  # Закрываем строку с assertEqual
-                "        sys.stdout = sys.__stdout__",  # Восстанавливаем стандартный вывод
+                f"        self.assertEqual(result, {expected})",
+                "        sys.stdout = sys.__stdout__",
             ])
 
         lines.extend([
@@ -196,30 +199,28 @@ class DockerCodeRunner:
             "",
             "if __name__ == '__main__':",
             "    suite = unittest.TestLoader().loadTestsFromTestCase(ScriptTestCase)",
-            "    runner = unittest.TextTestRunner(resultclass=CustomTestResult, stream=open('/dev/null', 'w'))",
-            "    result = runner.run(suite)",
+            "    with open(os.devnull, 'w') as devnull:",
+            "        runner = unittest.TextTestRunner(resultclass=CustomTestResult, stream=devnull)",
+            "        result = runner.run(suite)",
+            "",
             "    output = []",
             "    for test in result.successes:",
-            "        try:",
-            "            # Пытаемся извлечь id и name из имени метода",
-            "            test_method_name = test._testMethodName",
-            "            test_id = test_method_name.split('_')[-1]  # Получаем id, последний элемент после последнего \"_\"",
-            "            test_name = f'test_case_{test_id}'  # Имя теста формируется по id",
-            "            output.append({'id': test_id, 'name': test_name, 'status': 'success'})",
-            "        except IndexError as e:",
-            "            output.append({'status': 'error', 'error': f'Ошибка при извлечении id или name: {str(e)}'})",
+            "        test_method_name = test._testMethodName",
+            "        test_id = test_method_name.split('_')[-1]",
+            "        test_name = f'test_case_{test_id}'",
+            "        output.append({'id': test_id, 'name': test_name, 'status': 'success'})",
+            "",
             "    for test, err in result.failures + result.errors:",
-            "        try:",
-            "            test_method_name = test._testMethodName",
-            "            test_id = test_method_name.split('_')[-1]  # Получаем id, последний элемент после последнего \"_\"",
-            "            test_name = f'test_case_{test_id}'  # Имя теста формируется по id",
-            "            output.append({'id': test_id, 'name': test_name, 'status': 'fail', 'error': err})",
-            "        except IndexError as e:",
-            "            output.append({'status': 'error', 'error': f'Ошибка при извлечении id или name: {str(e)}'})",
+            "        test_method_name = test._testMethodName",
+            "        test_id = test_method_name.split('_')[-1]",
+            "        test_name = f'test_case_{test_id}'",
+            "        output.append({'id': test_id, 'name': test_name, 'status': 'fail', 'error': err})",
+            "",
             "    print(json.dumps(output))"
         ])
 
         return "\n".join(lines)
+
 
 
 

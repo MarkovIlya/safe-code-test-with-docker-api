@@ -1,9 +1,14 @@
 import logging
 import os
+import tempfile
+import shutil
+import docker
 from flask import Flask, request, jsonify
 from docker_runner.DockerCodeRunner import DockerCodeRunner
-from docker_runner.static_analyzer import analyze_code  # Импортируем статический анализатор
+from docker_runner.static_analyzer import analyze_code
 from concurrent.futures import ThreadPoolExecutor
+
+
 
 # ─── Настройка логирования ─────────────────────────────────────────────
 if not os.path.exists("logs"):
@@ -59,10 +64,12 @@ def run_code():
 
         logging.info("Запуск DockerCodeRunner с библиотеками: %s", data["libraries"])
         
+        image_name = data.get("docker_image", "python:3.11")
+
         # Запуск в отдельном потоке
         future = executor.submit(
             runner.run,
-            image_name="python:3.11",
+            image_name=image_name,
             user_code=data["code"],
             libraries=data["libraries"],
             tests=data["tests"],
@@ -78,6 +85,65 @@ def run_code():
 
     except Exception as e:
         logging.exception("Ошибка при обработке запроса:")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/image/build", methods=["POST"])
+def build_docker_image():
+    try:
+        data = request.get_json()
+        image_name = data.get("image_name")
+        libraries = data.get("libraries", [])
+
+        if not image_name:
+            return jsonify({"error": "image_name is required"}), 400
+
+        dockerfile_content = f"""
+        FROM python:3.11
+        RUN pip install {' '.join(libraries)}
+        WORKDIR /mnt/app
+        """
+
+        temp_dir = tempfile.mkdtemp()
+        dockerfile_path = os.path.join(temp_dir, "Dockerfile")
+
+        with open(dockerfile_path, "w") as f:
+            f.write(dockerfile_content)
+
+        logging.info("Сборка Docker образа %s с библиотеками: %s", image_name, libraries)
+        image, logs = runner.client.images.build(path=temp_dir, tag=image_name)
+
+        log_output = "\n".join(line.get("stream", "").strip() for line in logs if "stream" in line)
+        logging.info("Docker build logs:\n%s", log_output)
+
+        shutil.rmtree(temp_dir)
+        return jsonify({"status": "success", "image_name": image_name})
+
+    except Exception as e:
+        logging.exception("Ошибка при сборке Docker-образа:")
+        return jsonify({"status": "fail", "error": str(e)}), 500
+
+@app.route("/image/remove", methods=["POST"])
+def remove_docker_image():
+    try:
+        data = request.get_json()
+        if not data or "image_name" not in data:
+            return jsonify({"error": "Missing 'image_name' in request"}), 400
+
+        image_name = data["image_name"]
+        logging.info("Запрос на удаление Docker-образа: %s", image_name)
+
+        client = runner.client
+        client.images.remove(image=image_name, force=True)
+        logging.info("Образ успешно удалён: %s", image_name)
+
+        return jsonify({"status": "success", "message": f"Image '{image_name}' removed successfully"})
+
+    except docker.errors.ImageNotFound:
+        logging.warning("Образ не найден: %s", image_name)
+        return jsonify({"error": f"Image '{image_name}' not found"}), 404
+
+    except Exception as e:
+        logging.exception("Ошибка при удалении Docker-образа:")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
