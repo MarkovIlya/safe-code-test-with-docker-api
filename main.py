@@ -66,6 +66,11 @@ def run_code():
         
         image_name = data.get("docker_image", "python:3.11")
 
+        try:
+            runner.client.images.get(image_name)
+        except docker.errors.ImageNotFound:
+            return jsonify({"error": f"Docker image '{image_name}' not found"}), 404
+
         # Запуск в отдельном потоке
         future = executor.submit(
             runner.run,
@@ -74,7 +79,8 @@ def run_code():
             libraries=data["libraries"],
             tests=data["tests"],
             script_name=data["script_name"],
-            script_parameters=data["script_parameters"]
+            script_parameters=data["script_parameters"],
+            # cleanup=False # расскомментить, если хотите чтобы контейнеры не удалялись
         )
 
         result = future.result()
@@ -110,7 +116,12 @@ def build_docker_image():
             f.write(dockerfile_content)
 
         logging.info("Сборка Docker образа %s с библиотеками: %s", image_name, libraries)
-        image, logs = runner.client.images.build(path=temp_dir, tag=image_name)
+        image, logs = runner.client.images.build(
+            path=temp_dir, 
+            tag=image_name,
+            rm=True,          # удаляет промежуточные контейнеры
+            forcerm=True      # удаляет даже при ошибках
+        )
 
         log_output = "\n".join(line.get("stream", "").strip() for line in logs if "stream" in line)
         logging.info("Docker build logs:\n%s", log_output)
@@ -133,8 +144,26 @@ def remove_docker_image():
         logging.info("Запрос на удаление Docker-образа: %s", image_name)
 
         client = runner.client
+
+        # Остановка и удаление контейнеров, использующих образ
+        containers = client.containers.list(all=True, filters={"ancestor": image_name})
+        for container in containers:
+            logging.info("Остановка и удаление контейнера: %s", container.id)
+            container.stop()
+            container.remove()
+
+        # Удаление самого образа
         client.images.remove(image=image_name, force=True)
         logging.info("Образ успешно удалён: %s", image_name)
+
+        # Удаление всех dangling-образов
+        dangling_images = client.images.list(filters={"dangling": True})
+        for img in dangling_images:
+            try:
+                client.images.remove(img.id, force=True)
+                logging.info("Удалён dangling-образ: %s", img.id)
+            except Exception as e:
+                logging.warning("Не удалось удалить dangling-образ %s: %s", img.id, str(e))
 
         return jsonify({"status": "success", "message": f"Image '{image_name}' removed successfully"})
 
@@ -145,6 +174,7 @@ def remove_docker_image():
     except Exception as e:
         logging.exception("Ошибка при удалении Docker-образа:")
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     logging.info("Запуск Flask API...")
