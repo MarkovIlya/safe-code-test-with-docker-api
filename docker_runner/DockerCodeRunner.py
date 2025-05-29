@@ -7,14 +7,24 @@ import shutil
 import logging
 import ast
 import json
+import textwrap
 
 
 class DockerCodeRunner:
     def __init__(self):
         self.client = docker.from_env()
         self.logger = logging.getLogger(__name__)
+        default_image = "python:3.11"
+        try:
+            self.client.images.get(default_image)
+            logging.info(f"Базовый образ '{default_image}' уже загружен.")
+        except docker.errors.ImageNotFound:
+            logging.info(f"Образ '{default_image}' не найден. Загружаем...")
+            self.client.images.pull(default_image)
+        except Exception as e:
+            logging.error(f"Ошибка при проверке/загрузке образа: {e}")
 
-    def run(self, image_name, user_code, libraries, tests, script_name, script_parameters, cleanup=True):
+    def run(self, image_name, user_code, libraries, tests, script_name, script_parameters, timeout_ms=2000, cleanup=True):
         self.logger.info(f"Запуск контейнера с образом: {image_name}")
         self._validate_function(user_code, script_name, script_parameters)
 
@@ -24,7 +34,10 @@ class DockerCodeRunner:
 
         try:
             self._write_file(os.path.join(temp_dir, "script.py"), self._generate_script(user_code, libraries))
-            self._write_file(os.path.join(temp_dir, "test_script.py"), self._generate_tests(tests, script_name))
+            self._write_file(
+                os.path.join(temp_dir, "test_script.py"),
+                self._generate_tests(tests=tests, timeout_sec=timeout_ms / 1000.0)
+            )
 
             container = self._start_container(image_name)
             self._prepare_container(container, temp_dir, container_dir)
@@ -62,7 +75,6 @@ class DockerCodeRunner:
         return container
 
     def _prepare_container(self, container, host_dir, container_dir):
-        # Создание директории, если не существует
         container.exec_run(f"mkdir -p {container_dir}")
         self.logger.info("Копирование файлов в контейнер...")
         tar_data = self._create_tar_from_directory(host_dir)
@@ -87,10 +99,8 @@ class DockerCodeRunner:
         self.logger.info("Запуск тестов в контейнере...")
         exit_code, output = container.exec_run("python3 /mnt/app/test_script.py", demux=True)
         stdout, stderr = (output[0] or b"").decode().strip(), (output[1] or b"").decode().strip()
-
         self.logger.debug(f"STDOUT тестов:\n{stdout}")
         self.logger.debug(f"STDERR тестов:\n{stderr}")
-
         return stdout, stderr, exit_code
 
     def _parse_test_results(self, stdout, stderr, exit_code, install_output):
@@ -152,28 +162,66 @@ class DockerCodeRunner:
 
     def _generate_script(self, user_code, libraries):
         imports = "\n".join(f"import {lib}" for lib in libraries)
-        return f"{imports}\n\n{user_code.strip()}\n"
+        func_name = self._extract_function_name(user_code)
+        
+        main_code = textwrap.dedent(f"""
+            if __name__ == '__main__':
+                import sys
+                args = list(map(eval, sys.argv[1:]))
+                result = {func_name}(*args)
+                print(result)
+        """).strip()
 
-    def _generate_tests(self, tests, script_name):
+        return f"{imports}\n\n{user_code.strip()}\n\n{main_code}"
+
+    def _extract_function_name(self, code: str) -> str:
+        tree = ast.parse(code)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                return node.name
+        raise Exception("Не удалось извлечь имя функции из кода")
+
+    def _generate_tests(self, tests, timeout_sec=2):
         test_cases = []
         for idx, test in enumerate(tests):
-            params = ", ".join(repr(p) for p in test["parameters"])
-            expected = repr(test["results"][0])
+            params = ", ".join(repr(str(p)) for p in test["parameters"])
+            expected = str(test["results"][0])
             test_id = test.get("id", f"test_{idx + 1}")
+
             test_cases.append(f"""
-    def test_case_{test_id}(self):
-        sys.stdout = open(os.devnull, 'w')
-        result = {script_name}({params})
-        self.assertEqual(result, {expected})
-        sys.stdout = sys.__stdout__
-""")
+        def test_case_{test_id}(self):
+            import subprocess
+            import traceback
+
+            try:
+                proc = subprocess.Popen(
+                    ['python3', '/mnt/app/script.py', {params}],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                out, err = proc.communicate(timeout={timeout_sec})
+                lines = out.decode().splitlines()
+                result = lines[-1].strip() if lines else ''
+                self.assertEqual(result, {repr(expected)})
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                self._test_error = "Test exceeded {timeout_sec} seconds"
+                self._test_traceback = err.decode().strip()
+                self.fail(self._test_error)
+            except AssertionError as ae:
+                self._test_error = "Assertion error: " + str(ae)
+                self._test_traceback = traceback.format_exc()
+                self.fail(self._test_error)
+            except Exception as e:
+                self._test_error = str(e)
+                self._test_traceback = traceback.format_exc()
+                self.fail(self._test_error)
+    """)
 
         return "\n".join([
             "import unittest",
             "import json",
-            "import sys",
-            "import os",
-            "from script import *",
             "",
             "class ScriptTestCase(unittest.TestCase):",
             *test_cases,
@@ -189,9 +237,8 @@ class DockerCodeRunner:
             "",
             "if __name__ == '__main__':",
             "    suite = unittest.TestLoader().loadTestsFromTestCase(ScriptTestCase)",
-            "    with open(os.devnull, 'w') as devnull:",
-            "        runner = unittest.TextTestRunner(resultclass=CustomTestResult, stream=devnull)",
-            "        result = runner.run(suite)",
+            "    runner = unittest.TextTestRunner(resultclass=CustomTestResult)",
+            "    result = runner.run(suite)",
             "",
             "    output = []",
             "    for test in result.successes:",
@@ -202,7 +249,20 @@ class DockerCodeRunner:
             "    for test, err in result.failures + result.errors:",
             "        test_method_name = test._testMethodName",
             "        test_id = test_method_name.split('_')[-1]",
-            "        output.append({'id': test_id, 'name': test_method_name, 'status': 'fail', 'error': err})",
+            "        short_error = getattr(test, '_test_error', 'Unknown error')",
+            "        tb = getattr(test, '_test_traceback', err)",
+            "        output.append({",
+            "            'id': test_id,",
+            "            'name': test_method_name,",
+            "            'status': 'fail',",
+            "            'error': short_error,",
+            "            'traceback': tb",
+            "        })",
             "",
             "    print(json.dumps(output))"
         ])
+
+
+
+
+
