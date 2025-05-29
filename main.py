@@ -64,7 +64,9 @@ def run_code():
 
         logging.info("Запуск DockerCodeRunner с библиотеками: %s", data["libraries"])
         
-        image_name = data.get("docker_image", "python:3.11")
+        image_name = data.get("docker_image", "python:3.11") # Пуллить если нет при старте
+
+        timeout_ms = data.get("timeout_ms", 2000)  # По умолчанию 2000 мс (2 сек)
 
         try:
             runner.client.images.get(image_name)
@@ -77,10 +79,11 @@ def run_code():
             image_name=image_name,
             user_code=data["code"],
             libraries=data["libraries"],
+            timeout_ms=timeout_ms,
             tests=data["tests"],
             script_name=data["script_name"],
             script_parameters=data["script_parameters"],
-            # cleanup=False # расскомментить, если хотите чтобы контейнеры не удалялись
+            # cleanup=False # раскомментить, если хотите чтобы контейнеры не удалялись
         )
 
         result = future.result()
