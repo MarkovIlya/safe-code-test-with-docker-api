@@ -8,6 +8,7 @@ import logging
 import ast
 import json
 import textwrap
+import base64
 
 
 class DockerCodeRunner:
@@ -33,19 +34,33 @@ class DockerCodeRunner:
         self.logger.debug(f"Создана временная директория: {temp_dir}")
 
         try:
-            self._write_file(os.path.join(temp_dir, "script.py"), self._generate_script(user_code, libraries))
-            self._write_file(
-                os.path.join(temp_dir, "test_script.py"),
-                self._generate_tests(tests=tests, timeout_sec=timeout_ms / 1000.0)
-            )
-
-            container = self._start_container(image_name)
-            self._prepare_container(container, temp_dir, container_dir)
 
             try:
+
+                # запуск контейнера
+                container = self._start_container(image_name)
+                # установка библиотек
                 install_output = self._install_libraries(container, libraries)
+                # получение разрешённых модулей внутри контейнера
+                allowed_modules = self._get_installed_modules(container)
+
+                func_name = self._extract_function_name(user_code)
+
+                # генерация защищённого main.py на основе уже полученных allowed_modules
+                main_path = os.path.join(temp_dir, "main.py")
+                user_code_path = os.path.join(temp_dir, "user_code.py")
+                tests_path = os.path.join(temp_dir, "test_script.py")
+                self._write_file(main_path, self._generate_main(func_name, allowed_modules))
+                self._write_file(user_code_path, self._generate_user_code(user_code))
+                self._write_file(tests_path, self._generate_tests(tests=tests, timeout_sec=timeout_ms / 1000.0))
+
+                # передача файлов внутри контейнера
+                self._prepare_container(container, temp_dir, container_dir)
+
+                # запуск тестов
                 stdout, stderr, exit_code = self._run_tests(container)
 
+                # интерпретация результатов тестов
                 return self._parse_test_results(stdout, stderr, exit_code, install_output)
 
             finally:
@@ -104,31 +119,82 @@ class DockerCodeRunner:
         return stdout, stderr, exit_code
 
     def _parse_test_results(self, stdout, stderr, exit_code, install_output):
+        self.logger.debug(f"Начало обработки результатов тестов. Exit code: {exit_code}")
+        
+        # Обработка случаев, когда тесты не вернули JSON
         if not stdout:
-            self.logger.error("Ошибка: stdout тестов пустой!")
-            return {"status": "fail", "error": "Вывод тестов пустой", "raw_output": stdout, "stderr": stderr}
+            error_type = "EMPTY_OUTPUT" if not stderr else "RUNTIME_ERROR"
+            error_msg = stderr if stderr else "Тесты не вернули результат (пустой вывод)"
+            
+            return {
+                "status": "fail",
+                "error": {
+                    "type": error_type,
+                    "message": error_msg
+                },
+                "install_output": install_output,
+                "raw_output": stdout,
+                "stderr": stderr
+            }
 
         try:
             test_statuses = json.loads(stdout)
-            if not isinstance(test_statuses, list) or not all(
-                isinstance(t, dict) and {"id", "name", "status"}.issubset(t) for t in test_statuses
-            ):
-                raise ValueError("Неверный формат данных тестов")
+            
+            # Проверка структуры результатов тестов
+            if not isinstance(test_statuses, list):
+                return {
+                    "status": "fail",
+                    "error": {
+                        "type": "INVALID_TEST_STRUCTURE",
+                        "message": f"Ожидался список тестов, получен {type(test_statuses)}"
+                    },
+                    "install_output": install_output,
+                    "raw_output": stdout,
+                    "stderr": stderr
+                }
+                
+            # Добавляем обработку ошибок для каждого теста
+            for test in test_statuses:
+                if test.get("status") == "fail":
+                    if "error" not in test or not isinstance(test["error"], dict):
+                        test["error"] = {
+                            "type": "TEST_FAILURE",
+                            "message": test.get("error", "Тест не пройден")
+                        }
 
+            status = "success" if exit_code == 0 else "fail"
+            
             return {
-                "status": "success" if exit_code == 0 else "fail",
+                "status": status,
                 "install_output": install_output,
                 "test_output": stdout,
                 "test_statuses": test_statuses
             }
 
         except json.JSONDecodeError as e:
-            self.logger.exception("Ошибка при разборе JSON:")
-            return {"status": "fail", "error": f"Невозможно разобрать JSON: {e}", "raw_output": stdout}
-
-        except ValueError as e:
-            self.logger.exception("Ошибка в структуре результатов тестов:")
-            return {"status": "fail", "error": str(e), "raw_output": stdout}
+            error_msg = str(e)
+            if "SECURITY_ERROR" in stderr:
+                error_type = "SECURITY_VIOLATION"
+                error_msg = stderr.split("SECURITY_ERROR:")[-1].strip()
+            elif "IMPORT_ERROR" in stderr:
+                error_type = "IMPORT_ERROR"
+                error_msg = stderr.split("IMPORT_ERROR:")[-1].strip()
+            elif "RUNTIME_ERROR" in stderr:
+                error_type = "RUNTIME_ERROR"
+                error_msg = stderr.split("RUNTIME_ERROR:")[-1].strip()
+            else:
+                error_type = "PARSE_ERROR"
+                
+            return {
+                "status": "fail",
+                "error": {
+                    "type": error_type,
+                    "message": error_msg
+                },
+                "install_output": install_output,
+                "raw_output": stdout,
+                "stderr": stderr
+            }
 
     def _cleanup_container(self, container):
         self.logger.info(f"Остановка и удаление контейнера: {container.id}")
@@ -160,19 +226,112 @@ class DockerCodeRunner:
 
         raise Exception(f"Функция с именем '{function_name}' не найдена в коде участника.")
 
-    def _generate_script(self, user_code, libraries):
-        imports = "\n".join(f"import {lib}" for lib in libraries)
-        func_name = self._extract_function_name(user_code)
-        
-        main_code = textwrap.dedent(f"""
-            if __name__ == '__main__':
-                import sys
-                args = list(map(eval, sys.argv[1:]))
-                result = {func_name}(*args)
-                print(result)
-        """).strip()
+    def _get_installed_modules(self, container) -> list[str]:
+        self.logger.info("Получение разрешённых модулей внутри контейнера...")
+        script = textwrap.dedent("""
+            import json
+            import importlib.metadata
+            import sys
 
-        return f"{imports}\n\n{user_code.strip()}\n\n{main_code}"
+            modules = set()
+            for dist in importlib.metadata.distributions():
+                try:
+                    top_level = dist.read_text("top_level.txt")
+                    if top_level:
+                        for line in top_level.strip().splitlines():
+                            modules.add(line.strip())
+                except Exception:
+                    continue
+            print(json.dumps(list(modules)))
+        """)
+        # Кодируем скрипт в base64
+        encoded = base64.b64encode(script.encode()).decode()
+
+        # Расшифровка и исполнение в контейнере
+        cmd = f"python3 -c \"import base64; exec(base64.b64decode('{encoded}'))\""
+
+        exit_code, output = container.exec_run(cmd)
+        if exit_code != 0:
+            raise RuntimeError(f"Не удалось получить список модулей внутри контейнера:\n{output.decode()}")
+        return json.loads(output.decode().strip())
+
+    def _generate_main(self, func_name: str, allowed_modules: list[str]) -> str:
+        return textwrap.dedent(f"""
+            import sys
+            import json
+            import traceback
+
+            # 1. Устанавливаем аудит-хук ДО любых других операций
+            last_security_error = None
+            whitelist = {{
+                'sys', 'json', 'builtins',  # Базовые модули
+                *{allowed_modules!r}  # Разрешённые модули из конфига
+            }}
+            blacklist = {{
+                'os', 'subprocess', 'socket', 'threading', 'multiprocessing',
+                'ctypes', 'signal', 'shutil', 'sysconfig', 'requests', 'urllib',
+                'inspect', 'compileall'
+            }}
+
+            def audit_hook(event: str, args: tuple):
+                global last_security_error
+                if event == 'import':
+                    module = args[0].split('.')[0]
+                    if module == "user_code":
+                        return
+                    if module in blacklist or module not in whitelist:
+                        last_security_error = f'SECURITY_ERROR: Импорт модуля "{{module}}" запрещён!'
+                        raise ImportError(last_security_error)
+                elif event == 'compile':
+                    last_security_error = 'SECURITY_ERROR: Динамическая генерация кода запрещена!'
+                    raise RuntimeError(last_security_error)
+
+            sys.addaudithook(audit_hook)
+
+            # 2. Импортируем функцию из user_code.py
+            try:
+                from user_code import {func_name}
+            except ImportError as e:
+                error_type = "IMPORT_ERROR"
+                error_msg = str(e)
+                print({{
+                    "type": error_type,
+                    "message": error_msg,
+                    "traceback": traceback.format_exc()
+                }}, file=sys.stderr, flush=True)
+                sys.exit(1)
+            except Exception as e:
+                error_type = "RUNTIME_ERROR"
+                error_msg = str(e)
+                print({{
+                    "type": error_type,
+                    "message": error_msg,
+                    "traceback": traceback.format_exc()
+                }}, file=sys.stderr, flush=True)
+                sys.exit(1)
+
+            # 3. Вызываем функцию участника
+            if __name__ == "__main__":
+                args = [json.loads(arg) for arg in sys.argv[1:]]
+                try:
+                    result = {func_name}(*args)
+                    print(json.dumps(result))
+                except Exception as e:
+                    error_type = "RUNTIME_ERROR"
+                    error_msg = str(e)
+                    print({{
+                        "type": error_type,
+                        "message": error_msg,
+                        "traceback": traceback.format_exc()
+                    }}, file=sys.stderr, flush=True)
+                    sys.exit(1)
+        """)
+
+
+
+    def _generate_user_code(self, user_code: str) -> str:
+        return user_code.strip()
+
 
     def _extract_function_name(self, code: str) -> str:
         tree = ast.parse(code)
@@ -181,42 +340,82 @@ class DockerCodeRunner:
                 return node.name
         raise Exception("Не удалось извлечь имя функции из кода")
 
+    # Решить Assertion Error
     def _generate_tests(self, tests, timeout_sec=2):
         test_cases = []
         for idx, test in enumerate(tests):
-            params = ", ".join(repr(str(p)) for p in test["parameters"])
+            params_list = [json.dumps(p) for p in test["parameters"]]
+            params = ", ".join(repr(p) for p in params_list)
             expected = str(test["results"][0])
             test_id = test.get("id", f"test_{idx + 1}")
 
             test_cases.append(f"""
-        def test_case_{test_id}(self):
-            import subprocess
-            import traceback
+    def test_case_{test_id}(self):
+        import subprocess
+        import traceback
+        import json
 
+        self._test_error = None
+        self._test_error_type = None
+        self._test_traceback = None
+
+        try:
+            command = ['python3', '/mnt/app/main.py'] + [{params}]
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            out, err = proc.communicate(timeout={timeout_sec})
+            exit_code = proc.returncode
+            stdout = out.decode().strip()
+            stderr = err.decode().strip()
+
+            # Обработка ошибок безопасности
+            if exit_code == 42 or "SECURITY_ERROR" in stderr:
+                self._test_error_type = "SECURITY_VIOLATION"
+                self._test_error = stderr.split("SECURITY_ERROR:")[-1].strip()
+                raise RuntimeError(self._test_error)
+
+            # Обработка JSON ошибок из stderr
+            if stderr and stderr.startswith('{{"type":'):
+                try:
+                    error_data = json.loads(stderr)
+                    self._test_error_type = error_data.get("type", "UNKNOWN_ERROR")
+                    self._test_error = error_data.get("message", "Неизвестная ошибка")
+                    self._test_traceback = error_data.get("traceback", "")
+                    raise RuntimeError(self._test_error)
+                except json.JSONDecodeError:
+                    pass
+
+            # Проверка результата
             try:
-                proc = subprocess.Popen(
-                    ['python3', '/mnt/app/script.py', {params}],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                out, err = proc.communicate(timeout={timeout_sec})
-                lines = out.decode().splitlines()
-                result = lines[-1].strip() if lines else ''
-                self.assertEqual(result, {repr(expected)})
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
-                self._test_error = "Test exceeded {timeout_sec} seconds"
-                self._test_traceback = err.decode().strip()
-                self.fail(self._test_error)
-            except AssertionError as ae:
-                self._test_error = "Assertion error: " + str(ae)
-                self._test_traceback = traceback.format_exc()
-                self.fail(self._test_error)
-            except Exception as e:
+                result = json.loads(stdout) if stdout else None
+                self.assertEqual(result, {expected})
+            except json.JSONDecodeError:
+                self._test_error_type = "INVALID_OUTPUT"
+                self._test_error = f"Некорректный JSON вывод: {{stdout}}"
+                raise
+
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            self._test_error_type = "TIMEOUT"
+            self._test_error = f"Тест превысил лимит времени ({timeout_sec} сек)"
+            self._test_traceback = err.decode().strip()
+        except AssertionError as ae:
+            self._test_error_type = "ASSERTION_ERROR"
+            self._test_error = str(ae)
+            self._test_traceback = traceback.format_exc()
+        except Exception as e:
+            if not self._test_error_type:
+                self._test_error_type = "RUNTIME_ERROR"
                 self._test_error = str(e)
                 self._test_traceback = traceback.format_exc()
-                self.fail(self._test_error)
+            
+        if self._test_error:
+            self.fail(self._test_error)
     """)
 
         return "\n".join([
@@ -261,8 +460,6 @@ class DockerCodeRunner:
             "",
             "    print(json.dumps(output))"
         ])
-
-
 
 
 
