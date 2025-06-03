@@ -42,16 +42,16 @@ class DockerCodeRunner:
                 # установка библиотек
                 install_output = self._install_libraries(container, libraries)
                 # получение разрешённых модулей внутри контейнера
-                allowed_modules = self._get_installed_modules(container)
+                allowed_modules = self._get_installed_modules(container) + libraries
 
                 func_name = self._extract_function_name(user_code)
 
                 # генерация защищённого main.py на основе уже полученных allowed_modules
                 main_path = os.path.join(temp_dir, "main.py")
-                user_code_path = os.path.join(temp_dir, "user_code.py")
+                # user_code_path = os.path.join(temp_dir, "user_code.py")
                 tests_path = os.path.join(temp_dir, "test_script.py")
-                self._write_file(main_path, self._generate_main(func_name, allowed_modules))
-                self._write_file(user_code_path, self._generate_user_code(user_code))
+                self._write_file(main_path, self._generate_main(user_code, func_name, allowed_modules))
+                # self._write_file(user_code_path, self._generate_user_code(user_code))
                 self._write_file(tests_path, self._generate_tests(tests=tests, timeout_sec=timeout_ms / 1000.0))
 
                 # передача файлов внутри контейнера
@@ -255,77 +255,60 @@ class DockerCodeRunner:
             raise RuntimeError(f"Не удалось получить список модулей внутри контейнера:\n{output.decode()}")
         return json.loads(output.decode().strip())
 
-    def _generate_main(self, func_name: str, allowed_modules: list[str]) -> str:
+    def _generate_main(self, user_code, func_name: str, allowed_modules: list[str]) -> str:
         return textwrap.dedent(f"""
-            import sys
-            import json
-            import traceback
+import sys
+import json
+import traceback
 
-            # 1. Устанавливаем аудит-хук ДО любых других операций
-            last_security_error = None
-            whitelist = {{
-                'sys', 'json', 'builtins',  # Базовые модули
-                *{allowed_modules!r}  # Разрешённые модули из конфига
-            }}
-            blacklist = {{
-                'os', 'subprocess', 'socket', 'threading', 'multiprocessing',
-                'ctypes', 'signal', 'shutil', 'sysconfig', 'requests', 'urllib',
-                'inspect', 'compileall'
-            }}
+# 1. Устанавливаем аудит-хук ДО любых других операций
+last_security_error = None
+whitelist = {{
+    'sys', 'json', 'builtins',  # Базовые модули
+    *{allowed_modules!r}  # Разрешённые модули из конфига
+}}
+blacklist = {{
+    'os', 'subprocess', 'socket', 'threading', 'multiprocessing',
+    'ctypes', 'signal', 'shutil', 'sysconfig', 'requests', 'urllib',
+    'inspect', 'compileall'
+}}
 
-            def audit_hook(event: str, args: tuple):
-                global last_security_error
-                if event == 'import':
-                    module = args[0].split('.')[0]
-                    if module == "user_code":
-                        return
-                    if module in blacklist or module not in whitelist:
-                        last_security_error = f'SECURITY_ERROR: Импорт модуля "{{module}}" запрещён!'
-                        raise ImportError(last_security_error)
-                elif event == 'compile':
-                    last_security_error = 'SECURITY_ERROR: Динамическая генерация кода запрещена!'
-                    raise RuntimeError(last_security_error)
+ALLOW_COMPILE = False
 
-            sys.addaudithook(audit_hook)
+def audit_hook(event: str, args: tuple):
+    global last_security_error
+    if event == 'import':
+        module = args[0].split('.')[0]
+        if module == "user_code":
+            return
+        if module not in whitelist or module in blacklist:
+            last_security_error = f'SECURITY_ERROR: Импорт модуля "{{module}}" запрещён!'
+            raise ImportError(last_security_error)
+    elif event == 'compile':
+        if not ALLOW_COMPILE:
+            last_security_error = 'SECURITY_ERROR: Динамическая генерация кода запрещена!'
+            raise RuntimeError(last_security_error)
 
-            # 2. Импортируем функцию из user_code.py
-            try:
-                from user_code import {func_name}
-            except ImportError as e:
-                error_type = "IMPORT_ERROR"
-                error_msg = str(e)
-                print({{
-                    "type": error_type,
-                    "message": error_msg,
-                    "traceback": traceback.format_exc()
-                }}, file=sys.stderr, flush=True)
-                sys.exit(1)
-            except Exception as e:
-                error_type = "RUNTIME_ERROR"
-                error_msg = str(e)
-                print({{
-                    "type": error_type,
-                    "message": error_msg,
-                    "traceback": traceback.format_exc()
-                }}, file=sys.stderr, flush=True)
-                sys.exit(1)
+sys.addaudithook(audit_hook)
 
-            # 3. Вызываем функцию участника
-            if __name__ == "__main__":
-                args = [json.loads(arg) for arg in sys.argv[1:]]
-                try:
-                    result = {func_name}(*args)
-                    print(json.dumps(result))
-                except Exception as e:
-                    error_type = "RUNTIME_ERROR"
-                    error_msg = str(e)
-                    print({{
-                        "type": error_type,
-                        "message": error_msg,
-                        "traceback": traceback.format_exc()
-                    }}, file=sys.stderr, flush=True)
-                    sys.exit(1)
-        """)
+{user_code.strip()}
+
+# 3. Вызываем функцию участника
+if __name__ == "__main__":
+    args = [json.loads(arg) for arg in sys.argv[1:]]
+    try:
+        result = {func_name}(*args)
+        print(json.dumps(result))
+    except Exception as e:
+        error_type = "RUNTIME_ERROR"
+        error_msg = str(e)
+        print({{
+            "type": error_type,
+            "message": error_msg,
+            "traceback": traceback.format_exc()
+        }}, file=sys.stderr, flush=True)
+        sys.exit(1)
+    """)
 
 
 
