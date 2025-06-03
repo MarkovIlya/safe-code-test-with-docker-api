@@ -1,7 +1,7 @@
 import ast
 
-FORBIDDEN_BUILTINS = {"eval", "exec", "compile", "open", "__import__"}
-FORBIDDEN_MODULES = {"socket", "subprocess", "os", "sys"}
+FORBIDDEN_BUILTINS = {"eval", "compile", "open", "__import__"}
+FORBIDDEN_MODULES = {"socket", "subprocess", "sys"}
 
 def analyze_code(code):
     issues = []

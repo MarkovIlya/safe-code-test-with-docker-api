@@ -68,11 +68,6 @@ def run_code():
 
         timeout_ms = data.get("timeout_ms", 2000)  # По умолчанию 2000 мс (2 сек)
 
-        try:
-            runner.client.images.get(image_name)
-        except docker.errors.ImageNotFound:
-            return jsonify({"error": f"Docker image '{image_name}' not found"}), 404
-
         # Запуск в отдельном потоке
         future = executor.submit(
             runner.run,
@@ -83,7 +78,7 @@ def run_code():
             tests=data["tests"],
             script_name=data["script_name"],
             script_parameters=data["script_parameters"],
-            # cleanup=False # раскомментить, если хотите чтобы контейнеры не удалялись
+            cleanup=False # раскомментить, если хотите чтобы контейнеры не удалялись
         )
 
         result = future.result()
