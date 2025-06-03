@@ -48,10 +48,8 @@ class DockerCodeRunner:
 
                 # генерация защищённого main.py на основе уже полученных allowed_modules
                 main_path = os.path.join(temp_dir, "main.py")
-                # user_code_path = os.path.join(temp_dir, "user_code.py")
                 tests_path = os.path.join(temp_dir, "test_script.py")
                 self._write_file(main_path, self._generate_main(user_code, func_name, allowed_modules))
-                # self._write_file(user_code_path, self._generate_user_code(user_code))
                 self._write_file(tests_path, self._generate_tests(tests=tests, timeout_sec=timeout_ms / 1000.0))
 
                 # передача файлов внутри контейнера
@@ -260,6 +258,7 @@ class DockerCodeRunner:
 import sys
 import json
 import traceback
+import io                               
 
 # 1. Устанавливаем аудит-хук ДО любых других операций
 last_security_error = None
@@ -273,21 +272,16 @@ blacklist = {{
     'inspect', 'compileall'
 }}
 
-ALLOW_COMPILE = False
-
 def audit_hook(event: str, args: tuple):
     global last_security_error
     if event == 'import':
         module = args[0].split('.')[0]
-        if module == "user_code":
-            return
         if module not in whitelist or module in blacklist:
             last_security_error = f'SECURITY_ERROR: Импорт модуля "{{module}}" запрещён!'
             raise ImportError(last_security_error)
     elif event == 'compile':
-        if not ALLOW_COMPILE:
-            last_security_error = 'SECURITY_ERROR: Динамическая генерация кода запрещена!'
-            raise RuntimeError(last_security_error)
+        last_security_error = 'SECURITY_ERROR: Динамическая генерация кода запрещена!'
+        raise RuntimeError(last_security_error)
 
 sys.addaudithook(audit_hook)
 
@@ -297,7 +291,14 @@ sys.addaudithook(audit_hook)
 if __name__ == "__main__":
     args = [json.loads(arg) for arg in sys.argv[1:]]
     try:
-        result = {func_name}(*args)
+        # Подавляем print() участника
+        stdout_backup = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            result = {func_name}(*args)
+        finally:
+            sys.stdout = stdout_backup
+
         print(json.dumps(result))
     except Exception as e:
         error_type = "RUNTIME_ERROR"
@@ -310,12 +311,6 @@ if __name__ == "__main__":
         sys.exit(1)
     """)
 
-
-
-    def _generate_user_code(self, user_code: str) -> str:
-        return user_code.strip()
-
-
     def _extract_function_name(self, code: str) -> str:
         tree = ast.parse(code)
         for node in tree.body:
@@ -323,7 +318,6 @@ if __name__ == "__main__":
                 return node.name
         raise Exception("Не удалось извлечь имя функции из кода")
 
-    # Решить Assertion Error
     def _generate_tests(self, tests, timeout_sec=2):
         test_cases = []
         for idx, test in enumerate(tests):
