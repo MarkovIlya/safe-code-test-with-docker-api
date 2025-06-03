@@ -78,7 +78,7 @@ def run_code():
             tests=data["tests"],
             script_name=data["script_name"],
             script_parameters=data["script_parameters"],
-            cleanup=False # раскомментить, если хотите чтобы контейнеры не удалялись
+            # cleanup=False # раскомментить, если хотите чтобы контейнеры не удалялись
         )
 
         result = future.result()
