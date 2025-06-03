@@ -68,11 +68,6 @@ def run_code():
 
         timeout_ms = data.get("timeout_ms", 2000)  # По умолчанию 2000 мс (2 сек)
 
-        try:
-            runner.client.images.get(image_name)
-        except docker.errors.ImageNotFound:
-            return jsonify({"error": f"Docker image '{image_name}' not found"}), 404
-
         # Запуск в отдельном потоке
         future = executor.submit(
             runner.run,
