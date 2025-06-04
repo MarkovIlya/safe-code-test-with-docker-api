@@ -108,7 +108,7 @@ def build_docker_image():
         # Сохраняем Python-скрипт генерации allowed_modules.json
         generator_script_path = os.path.join(temp_dir, "generate_allowed_modules.py")
         with open(generator_script_path, "w", encoding="utf-8") as f:
-            f.write(DockerCodeRunner.generate_allowed_modules_script(libraries))
+            f.write(DockerCodeRunner().generate_allowed_modules_script(libraries))
 
         # Создаём Dockerfile
         dockerfile_content = f"""

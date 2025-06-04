@@ -123,14 +123,17 @@ import json
 import sys
 import pkgutil
 import importlib
+import importlib.metadata
 import subprocess
+import site
+import os
 
 allowed = set()
 
 # Встроенные модули
 allowed |= set(sys.builtin_module_names)
 
-# Модули из pip
+# pip list
 try:
     output = subprocess.check_output(["pip", "list", "--format=json"], text=True)
     installed = json.loads(output)
@@ -147,19 +150,55 @@ try:
 except Exception:
     pass
 
-# Добавим стандартные модули, сканируя sys.path
+# top_level.txt
+try:
+    for dist in importlib.metadata.distributions():
+        try:
+            top_level = dist.read_text('top_level.txt')
+            if top_level:
+                for name in top_level.strip().splitlines():
+                    allowed.add(name.strip())
+        except Exception:
+            continue
+except Exception:
+    pass
+
+# sys.path scan
 for finder, name, _ in pkgutil.iter_modules():
     allowed.add(name)
 
-# Удалим возможные пустые или приватные
-allowed = {{x for x in allowed if x and not x.startswith("_")}}
+# site-packages scan
+for sp in site.getsitepackages():
+    try:
+        for entry in os.listdir(sp):
+            path = os.path.join(sp, entry)
+            if os.path.isdir(path) and entry.isidentifier():
+                allowed.add(entry)
+            elif entry.endswith(".py") and entry[:-3].isidentifier():
+                allowed.add(entry[:-3])
+    except Exception:
+        continue
+
+# Импортируем корневые модули из переданных библиотек
+requested_modules = {libraries!r}
+for lib in requested_modules:
+    root = lib.split('.')[0]
+    try:
+        importlib.import_module(root)
+        allowed.add(root)
+    except Exception:
+        pass
+
+# Удалим пустые значения
+allowed = {{x for x in allowed if x}}
 
 # Сохраняем
 with open("/allowed_modules.json", "w", encoding="utf-8") as f:
-    json.dump(sorted(allowed), f)
-
-
+    json.dump(sorted(allowed), f, ensure_ascii=False)
 '''
+
+
+
 
 
 
@@ -391,34 +430,65 @@ EXTRA_ALLOWED = set({allowed_modules!r})
 
 # Финальный whitelist
 WHITELIST = {{
-    'sys', 'json', 'builtins'
+    'sys', 'json', 'builtins', "org", "ctypes"
 }} | ALLOWED_MODULES | EXTRA_ALLOWED
 
 # Явно запрещённые модули
 BLACKLIST = {{
     'os', 'subprocess', 'socket', 'threading', 'multiprocessing',
-    'ctypes', 'signal', 'shutil', 'sysconfig', 'requests', 'urllib',
+    'signal', 'shutil', 'sysconfig', 'requests', 'urllib',
     'inspect', 'compileall'
 }}
 
+# Проверка, является ли фрейм доверенным (например, из разрешённой библиотеки)
+def is_trusted_module(frame):
+    module_name = frame.f_globals.get('__name__')
+    if module_name:
+        root = module_name.split('.')[0]
+        if root in WHITELIST:
+            return True
+
+    file_path = frame.f_globals.get('__file__')
+    if file_path and any(path in file_path for path in ('/site-packages/', '/usr/local/lib/python', '/lib/python')):
+        return True
+
+    return False
+
+# Аудит-хук для контроля событий безопасности
 def audit_hook(event: str, args):
-    if event == 'import':
+    if event in ('compile', 'exec'):
+        trusted = False
+        for i in range(10):
+            try:
+                frame = sys._getframe(i)
+                if is_trusted_module(frame):
+                    trusted = True
+                    break
+            except Exception:
+                continue
+
+        if not trusted:
+            print(json.dumps({{
+                "type": "SECURITY_VIOLATION",
+                "message": f"Динамическая генерация кода запрещена ({{event}})",
+                "traceback": ""
+            }}), file=sys.stderr, flush=True)
+            sys.exit(42)
+
+    elif event == 'import':
         module = args[0].split('.')[0]
         if module not in WHITELIST or module in BLACKLIST:
+            # 🔍 Отладка запрещённого импорта
+            print(f"[DEBUG] Запрещённый импорт модуля: '{{module}}'", file=sys.stderr, flush=True)
+            traceback.print_stack(file=sys.stderr)
             print(json.dumps({{
                 "type": "SECURITY_VIOLATION",
                 "message": f"Импорт модуля '{{module}}' запрещён",
                 "traceback": ""
-            }}), file=sys.stderr)
+            }}), file=sys.stderr, flush=True)
             sys.exit(42)
-    elif event == 'compile':
-        print(json.dumps({{
-            "type": "SECURITY_VIOLATION",
-            "message": "Динамическая генерация кода запрещена (compile)",
-            "traceback": ""
-        }}), file=sys.stderr)
-        sys.exit(42)
 
+# Установка хука
 sys.addaudithook(audit_hook)
 
 # Блокировка встроенных опасных функций (будет применена позже)
@@ -430,15 +500,8 @@ def block_builtin(name):
         raise SecurityViolation(f"Использование {{name}} запрещено")
     return wrapper
 
-# ЭТАП 1: разрешаем exec и compile (eval блокируем всегда)
-builtins.eval = block_builtin("eval")
-
-# Вставка пользовательского кода (импорт, объявления и т.д.)
+# Вставка пользовательского кода
 {user_code.strip()}
-
-# ЭТАП 2: блокируем exec и compile после загрузки кода
-builtins.exec = block_builtin("exec")
-builtins.compile = block_builtin("compile")
 
 # Вызов тестируемой функции
 if __name__ == "__main__":
@@ -485,6 +548,9 @@ if __name__ == "__main__":
         }}), file=sys.stderr, flush=True)
         sys.exit(1)
 """)
+
+
+
 
 
 
