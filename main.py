@@ -101,24 +101,39 @@ def build_docker_image():
         if not image_name:
             return jsonify({"error": "image_name is required"}), 400
 
-        dockerfile_content = f"""
-        FROM python:3.11
-        RUN pip install {' '.join(libraries)}
-        WORKDIR /mnt/app
-        """
+        pip_libraries = ' '.join(libraries)
 
         temp_dir = tempfile.mkdtemp()
-        dockerfile_path = os.path.join(temp_dir, "Dockerfile")
 
-        with open(dockerfile_path, "w") as f:
+        # Сохраняем Python-скрипт генерации allowed_modules.json
+        generator_script_path = os.path.join(temp_dir, "generate_allowed_modules.py")
+        with open(generator_script_path, "w", encoding="utf-8") as f:
+            f.write(DockerCodeRunner.generate_allowed_modules_script(libraries))
+
+        # Создаём Dockerfile
+        dockerfile_content = f"""
+FROM python:3.11
+
+RUN pip install {pip_libraries}
+COPY generate_allowed_modules.py /generate_allowed_modules.py
+RUN python3 /generate_allowed_modules.py
+
+RUN cat /allowed_modules.json
+
+WORKDIR /mnt/app
+"""
+
+        dockerfile_path = os.path.join(temp_dir, "Dockerfile")
+        with open(dockerfile_path, "w", encoding="utf-8") as f:
             f.write(dockerfile_content)
 
+        # Сборка Docker-образа
         logging.info("Сборка Docker образа %s с библиотеками: %s", image_name, libraries)
         image, logs = runner.client.images.build(
-            path=temp_dir, 
+            path=temp_dir,
             tag=image_name,
-            rm=True,          # удаляет промежуточные контейнеры
-            forcerm=True      # удаляет даже при ошибках
+            rm=True,
+            forcerm=True
         )
 
         log_output = "\n".join(line.get("stream", "").strip() for line in logs if "stream" in line)
@@ -130,6 +145,12 @@ def build_docker_image():
     except Exception as e:
         logging.exception("Ошибка при сборке Docker-образа:")
         return jsonify({"status": "fail", "error": str(e)}), 500
+
+
+@app.route("/image/list", methods=["GET"])
+def list_images():
+    images = runner.client.images.list()
+    return jsonify([img.tags[0] for img in images if img.tags])
 
 @app.route("/image/remove", methods=["POST"])
 def remove_docker_image():

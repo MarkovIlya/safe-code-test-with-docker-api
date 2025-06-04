@@ -9,6 +9,7 @@ import ast
 import json
 import textwrap
 import base64
+import subprocess
 
 
 class DockerCodeRunner:
@@ -34,31 +35,49 @@ class DockerCodeRunner:
         self.logger.debug(f"Создана временная директория: {temp_dir}")
 
         try:
-
             try:
-
-                # запуск контейнера
                 container = self._start_container(image_name)
-                # установка библиотек
+
+                # Устанавливаем библиотеки (если переданы)
                 install_output = self._install_libraries(container, libraries)
-                # получение разрешённых модулей внутри контейнера
-                allowed_modules = self._get_installed_modules(container) + libraries
 
-                func_name = self._extract_function_name(user_code)
+                # Пытаемся загрузить allowed_modules.json из образа
+                try:
+                    allowed_modules = self._load_allowed_modules_from_image(image_name)
+                except Exception as e:
+                    self.logger.warning(f"Не удалось загрузить allowed_modules.json из образа: {e}")
+                    self.logger.info("Генерируем allowed_modules.json внутри контейнера...")
 
-                # генерация защищённого main.py на основе уже полученных allowed_modules
+                    # 1. Создаём скрипт генерации
+                    generator_code = self.generate_allowed_modules_script(libraries)
+                    generator_path = os.path.join(temp_dir, "generate_allowed_modules.py")
+                    self._write_file(generator_path, generator_code)
+
+                    # 2. Копируем в контейнер
+                    self._prepare_container(container, temp_dir, container_dir)
+
+                    # 3. Запускаем скрипт внутри контейнера
+                    stdout, stderr, exit_code = self._exec_in_container(container, ["python3", "generate_allowed_modules.py"])
+                    if exit_code != 0:
+                        raise RuntimeError(f"Ошибка при генерации allowed_modules.json: {stderr}")
+
+                    allowed_modules = self._load_allowed_modules_from_container(container.id)
+
+                self.logger.info("Разрешённые модули внутри контейнера: %s", allowed_modules)
+
+                # Генерируем файлы main.py и test_script.py
                 main_path = os.path.join(temp_dir, "main.py")
                 tests_path = os.path.join(temp_dir, "test_script.py")
+                func_name = self._extract_function_name(user_code)
+
                 self._write_file(main_path, self._generate_main(user_code, func_name, allowed_modules))
                 self._write_file(tests_path, self._generate_tests(tests=tests, timeout_sec=timeout_ms / 1000.0))
 
-                # передача файлов внутри контейнера
+                # Копируем все файлы (ещё раз, чтобы обновить main.py и тесты)
                 self._prepare_container(container, temp_dir, container_dir)
 
-                # запуск тестов
+                # Запускаем тесты
                 stdout, stderr, exit_code = self._run_tests(container)
-
-                # интерпретация результатов тестов
                 return self._parse_test_results(stdout, stderr, exit_code, install_output)
 
             finally:
@@ -72,6 +91,57 @@ class DockerCodeRunner:
         finally:
             shutil.rmtree(temp_dir)
             self.logger.debug(f"Удалена временная директория: {temp_dir}")
+
+
+    def _exec_in_container(self, container, command, working_dir="/mnt/app"):
+        """
+        Выполняет команду внутри контейнера и возвращает stdout, stderr, exit_code.
+        """
+        exec_result = self.client.api.exec_create(
+            container.id,
+            cmd=command,
+            workdir=working_dir
+        )
+        output = self.client.api.exec_start(exec_result["Id"], demux=True)
+        exit_code = self.client.api.exec_inspect(exec_result["Id"])["ExitCode"]
+
+        stdout, stderr = output
+        stdout = stdout.decode("utf-8") if stdout else ""
+        stderr = stderr.decode("utf-8") if stderr else ""
+
+        self.logger.debug(f"Выполнена команда в контейнере: {' '.join(command)}")
+        self.logger.debug(f"stdout: {stdout}")
+        self.logger.debug(f"stderr: {stderr}")
+        self.logger.debug(f"exit_code: {exit_code}")
+
+        return stdout, stderr, exit_code
+
+
+    def generate_allowed_modules_script(self, libraries):
+        allowed_list = ', '.join(f'"{lib}"' for lib in libraries)
+        return f"""\
+import json
+import importlib.metadata as m
+
+allowed = [{allowed_list}]
+allowed = set(x.lower() for x in allowed)
+deps = set()
+
+for dist in m.distributions():
+    name = dist.metadata.get("Name")
+    if not name:
+        continue
+    name = name.lower()
+    if name in allowed:
+        requires = dist.requires or []
+        for r in requires:
+            deps.add(r.split()[0].lower())
+        deps.add(name)
+
+with open("/allowed_modules.json", "w", encoding="utf-8") as f:
+    json.dump(sorted(deps), f)
+"""
+
 
     def _write_file(self, path, content):
         with open(path, "w", encoding="utf-8") as f:
@@ -107,6 +177,13 @@ class DockerCodeRunner:
         if exit_code != 0:
             raise Exception(f"Ошибка установки библиотек:\n{decoded_output}")
         return decoded_output
+    
+    def _extract_function_name(self, code: str) -> str:
+        tree = ast.parse(code)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                return node.name
+        raise Exception("Не удалось извлечь имя функции из кода")
 
     def _run_tests(self, container):
         self.logger.info("Запуск тестов в контейнере...")
@@ -116,6 +193,63 @@ class DockerCodeRunner:
         self.logger.debug(f"STDERR тестов:\n{stderr}")
         return stdout, stderr, exit_code
 
+    def _cleanup_container(self, container):
+        self.logger.info(f"Остановка и удаление контейнера: {container.id}")
+        container.kill()
+        container.remove()
+
+    def _create_tar_from_directory(self, src_dir):
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+            tar.add(src_dir, arcname=".")
+        tar_stream.seek(0)
+        return tar_stream
+
+    def _validate_function(self, code, function_name, required_params):
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            raise Exception(f"Синтаксическая ошибка в коде:\n{e}")
+
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == function_name:
+                actual_params = [arg.arg for arg in node.args.args]
+                missing = [p for p in required_params if p not in actual_params]
+                if missing:
+                    raise Exception(
+                        f"Функция '{function_name}' не содержит необходимые параметры: {', '.join(missing)}"
+                    )
+                return
+
+        raise Exception(f"Функция с именем '{function_name}' не найдена в коде участника.")
+
+    def _load_allowed_modules_from_image(self, image_name: str) -> list[str]:
+        """
+        Извлекает /allowed_modules.json из образа и возвращает список модулей.
+        """
+        container = self.client.containers.create(image=image_name, command="cat /allowed_modules.json")
+        try:
+            container.start()
+            output = container.logs(stdout=True, stderr=False)
+            return json.loads(output.decode("utf-8"))
+        finally:
+            container.remove(force=True)
+
+    def _get_installed_modules(self, image_name):
+        """
+        Возвращает список всех установленных модулей внутри образа.
+        """
+        command = (
+            "python3 -c \"import pkgutil, json; "
+            "print(json.dumps(sorted(set([m.name for m in pkgutil.iter_modules()]))) )\""
+        )
+        output = self.client.containers.run(
+            image=image_name,
+            command=command,
+            remove=True
+        )
+        return json.loads(output.decode())
+    
     def _parse_test_results(self, stdout, stderr, exit_code, install_output):
         self.logger.debug(f"Начало обработки результатов тестов. Exit code: {exit_code}")
         
@@ -193,130 +327,144 @@ class DockerCodeRunner:
                 "raw_output": stdout,
                 "stderr": stderr
             }
+    
 
-    def _cleanup_container(self, container):
-        self.logger.info(f"Остановка и удаление контейнера: {container.id}")
-        container.kill()
-        container.remove()
+    def _load_allowed_modules_from_container(self, container_id: str):
+        command = ["docker", "exec", container_id, "cat", "/allowed_modules.json"]
+        output = subprocess.check_output(command)
+        if not output.strip():
+            raise RuntimeError("Файл allowed_modules.json отсутствует или пуст в контейнере")
+        return json.loads(output.decode("utf-8"))
 
-    def _create_tar_from_directory(self, src_dir):
-        tar_stream = io.BytesIO()
-        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-            tar.add(src_dir, arcname=".")
-        tar_stream.seek(0)
-        return tar_stream
 
-    def _validate_function(self, code, function_name, required_params):
-        try:
-            tree = ast.parse(code)
-        except SyntaxError as e:
-            raise Exception(f"Синтаксическая ошибка в коде:\n{e}")
-
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name == function_name:
-                actual_params = [arg.arg for arg in node.args.args]
-                missing = [p for p in required_params if p not in actual_params]
-                if missing:
-                    raise Exception(
-                        f"Функция '{function_name}' не содержит необходимые параметры: {', '.join(missing)}"
-                    )
-                return
-
-        raise Exception(f"Функция с именем '{function_name}' не найдена в коде участника.")
-
-    def _get_installed_modules(self, container) -> list[str]:
-        self.logger.info("Получение разрешённых модулей внутри контейнера...")
-        script = textwrap.dedent("""
-            import json
-            import importlib.metadata
-            import sys
-
-            modules = set()
-            for dist in importlib.metadata.distributions():
-                try:
-                    top_level = dist.read_text("top_level.txt")
-                    if top_level:
-                        for line in top_level.strip().splitlines():
-                            modules.add(line.strip())
-                except Exception:
-                    continue
-            print(json.dumps(list(modules)))
-        """)
-        # Кодируем скрипт в base64
-        encoded = base64.b64encode(script.encode()).decode()
-
-        # Расшифровка и исполнение в контейнере
-        cmd = f"python3 -c \"import base64; exec(base64.b64decode('{encoded}'))\""
-
-        exit_code, output = container.exec_run(cmd)
-        if exit_code != 0:
-            raise RuntimeError(f"Не удалось получить список модулей внутри контейнера:\n{output.decode()}")
-        return json.loads(output.decode().strip())
-
-    def _generate_main(self, user_code, func_name: str, allowed_modules: list[str]) -> str:
+    def _generate_main(self, user_code: str, func_name: str, allowed_modules: list[str]) -> str:
         return textwrap.dedent(f"""
 import sys
 import json
 import traceback
-import io                               
+import io
+import builtins
 
-# 1. Устанавливаем аудит-хук ДО любых других операций
-last_security_error = None
-whitelist = {{
-    'sys', 'json', 'builtins',  # Базовые модули
-    *{allowed_modules!r}  # Разрешённые модули из конфига
-}}
-blacklist = {{
+# Загрузка разрешённых модулей из Docker-образа
+try:
+    with open('/allowed_modules.json', 'r') as f:
+        raw_modules = json.load(f)
+except Exception as e:
+    print(json.dumps({{
+        "type": "SECURITY_VIOLATION",
+        "message": "Не удалось загрузить /allowed_modules.json",
+        "traceback": str(e)
+    }}), file=sys.stderr)
+    sys.exit(42)
+
+# Функция извлечения имени модуля
+def extract_module_name(name: str) -> str:
+    return name.split('>=')[0].split('==')[0].split('<=')[0].strip()
+
+# Модули, разрешённые по умолчанию и через зависимые библиотеки
+ALLOWED_MODULES = set(map(extract_module_name, raw_modules))
+
+# Явно разрешённые (например, из /run запроса)
+EXTRA_ALLOWED = set({allowed_modules!r})
+
+# Финальный whitelist
+WHITELIST = {{
+    'sys', 'json', 'builtins'
+}} | ALLOWED_MODULES | EXTRA_ALLOWED
+
+# Явно запрещённые модули
+BLACKLIST = {{
     'os', 'subprocess', 'socket', 'threading', 'multiprocessing',
     'ctypes', 'signal', 'shutil', 'sysconfig', 'requests', 'urllib',
     'inspect', 'compileall'
 }}
 
-def audit_hook(event: str, args: tuple):
-    global last_security_error
+def audit_hook(event: str, args):
     if event == 'import':
         module = args[0].split('.')[0]
-        if module not in whitelist or module in blacklist:
-            last_security_error = f'SECURITY_ERROR: Импорт модуля "{{module}}" запрещён!'
-            raise ImportError(last_security_error)
+        if module not in WHITELIST or module in BLACKLIST:
+            print(json.dumps({{
+                "type": "SECURITY_VIOLATION",
+                "message": f"Импорт модуля '{{module}}' запрещён",
+                "traceback": ""
+            }}), file=sys.stderr)
+            sys.exit(42)
     elif event == 'compile':
-        last_security_error = 'SECURITY_ERROR: Динамическая генерация кода запрещена!'
-        raise RuntimeError(last_security_error)
+        print(json.dumps({{
+            "type": "SECURITY_VIOLATION",
+            "message": "Динамическая генерация кода запрещена (compile)",
+            "traceback": ""
+        }}), file=sys.stderr)
+        sys.exit(42)
 
 sys.addaudithook(audit_hook)
 
+# Блокировка встроенных опасных функций (будет применена позже)
+class SecurityViolation(Exception):
+    pass
+
+def block_builtin(name):
+    def wrapper(*args, **kwargs):
+        raise SecurityViolation(f"Использование {{name}} запрещено")
+    return wrapper
+
+# ЭТАП 1: разрешаем exec и compile (eval блокируем всегда)
+builtins.eval = block_builtin("eval")
+
+# Вставка пользовательского кода (импорт, объявления и т.д.)
 {user_code.strip()}
 
-# 3. Вызываем функцию участника
+# ЭТАП 2: блокируем exec и compile после загрузки кода
+builtins.exec = block_builtin("exec")
+builtins.compile = block_builtin("compile")
+
+# Вызов тестируемой функции
 if __name__ == "__main__":
-    args = [json.loads(arg) for arg in sys.argv[1:]]
     try:
-        # Подавляем print() участника
+        args = [json.loads(arg) for arg in sys.argv[1:]]
+
+        # Перехват stdout
         stdout_backup = sys.stdout
-        sys.stdout = io.StringIO()
+        fake_stdout = io.StringIO()
+        sys.stdout = fake_stdout
+
         try:
-            result = {func_name}(*args)
+            func = globals().get("{func_name}")
+            if not callable(func):
+                raise ValueError("Функция '{func_name}' не найдена")
+            result = func(*args)
         finally:
             sys.stdout = stdout_backup
 
-        print(json.dumps(result))
-    except Exception as e:
-        error_type = "RUNTIME_ERROR"
-        error_msg = str(e)
-        print({{
-            "type": error_type,
-            "message": error_msg,
-            "traceback": traceback.format_exc()
-        }}, file=sys.stderr, flush=True)
-        sys.exit(1)
-    """)
+        if result is None:
+            raise ValueError("Функция вернула None. Убедитесь, что используется оператор return.")
 
-    def _extract_function_name(self, code: str) -> str:
-        tree = ast.parse(code)
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef):
-                return node.name
-        raise Exception("Не удалось извлечь имя функции из кода")
+        try:
+            json_output = json.dumps(result)
+            print(f"[DEBUG] Результат перед JSON: {{result!r}}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] JSON результат: {{json_output}}", file=sys.stderr, flush=True)
+            print(json_output)
+        except Exception:
+            raise ValueError(f"Результат не сериализуем в JSON: {{result!r}}")
+
+    except SecurityViolation as sv:
+        print(json.dumps({{
+            "type": "SECURITY_VIOLATION",
+            "message": str(sv),
+            "traceback": ""
+        }}), file=sys.stderr, flush=True)
+        sys.exit(42)
+
+    except Exception as e:
+        print(json.dumps({{
+            "type": "RUNTIME_ERROR",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }}), file=sys.stderr, flush=True)
+        sys.exit(1)
+""")
+
+
 
     def _generate_tests(self, tests, timeout_sec=2):
         test_cases = []
@@ -324,82 +472,109 @@ if __name__ == "__main__":
             params_list = [json.dumps(p) for p in test["parameters"]]
             params = ", ".join(repr(p) for p in params_list)
             expected = str(test["results"][0])
-            test_id = test.get("id", f"test_{idx + 1}")
+            test_id = test.get("id", f"{idx + 1}")
 
-            test_cases.append(f"""
-    def test_case_{test_id}(self):
-        import subprocess
-        import traceback
-        import json
-
-        self._test_error = None
-        self._test_error_type = None
-        self._test_traceback = None
-
-        try:
-            command = ['python3', '/mnt/app/main.py'] + [{params}]
-            proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+            test_cases.append(
+                f"    def test_case_{test_id}(self):\n"
+                f"        self._run_test_case({params}, expected={expected}, timeout={timeout_sec}, test_id='{test_id}')"
             )
-
-            out, err = proc.communicate(timeout={timeout_sec})
-            exit_code = proc.returncode
-            stdout = out.decode().strip()
-            stderr = err.decode().strip()
-
-            # Обработка ошибок безопасности
-            if exit_code == 42 or "SECURITY_ERROR" in stderr:
-                self._test_error_type = "SECURITY_VIOLATION"
-                self._test_error = stderr.split("SECURITY_ERROR:")[-1].strip()
-                raise RuntimeError(self._test_error)
-
-            # Обработка JSON ошибок из stderr
-            if stderr and stderr.startswith('{{"type":'):
-                try:
-                    error_data = json.loads(stderr)
-                    self._test_error_type = error_data.get("type", "UNKNOWN_ERROR")
-                    self._test_error = error_data.get("message", "Неизвестная ошибка")
-                    self._test_traceback = error_data.get("traceback", "")
-                    raise RuntimeError(self._test_error)
-                except json.JSONDecodeError:
-                    pass
-
-            # Проверка результата
-            try:
-                result = json.loads(stdout) if stdout else None
-                self.assertEqual(result, {expected})
-            except json.JSONDecodeError:
-                self._test_error_type = "INVALID_OUTPUT"
-                self._test_error = f"Некорректный JSON вывод: {{stdout}}"
-                raise
-
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
-            self._test_error_type = "TIMEOUT"
-            self._test_error = f"Тест превысил лимит времени ({timeout_sec} сек)"
-            self._test_traceback = err.decode().strip()
-        except AssertionError as ae:
-            self._test_error_type = "ASSERTION_ERROR"
-            self._test_error = str(ae)
-            self._test_traceback = traceback.format_exc()
-        except Exception as e:
-            if not self._test_error_type:
-                self._test_error_type = "RUNTIME_ERROR"
-                self._test_error = str(e)
-                self._test_traceback = traceback.format_exc()
-            
-        if self._test_error:
-            self.fail(self._test_error)
-    """)
 
         return "\n".join([
             "import unittest",
             "import json",
+            "import subprocess",
+            "import traceback",
+            "import sys",
             "",
             "class ScriptTestCase(unittest.TestCase):",
+            "    def _run_test_case(self, *args, expected, timeout, test_id):",
+            "        self._test_error = None",
+            "        self._test_error_type = None",
+            "        self._test_traceback = None",
+            "        try:",
+            "            command = ['python3', '/mnt/app/main.py'] + list(args)",
+            "            proc = subprocess.Popen(",
+            "                command,",
+            "                stdout=subprocess.PIPE,",
+            "                stderr=subprocess.PIPE",
+            "            )",
+            "",
+            "            out, err = proc.communicate(timeout=timeout)",
+            "            exit_code = proc.returncode",
+            "            stdout = out.decode().strip()",
+            "            stderr = err.decode().strip()",
+            "",
+            "            print(f'[DEBUG] STDOUT: {stdout}', file=sys.stderr , flush=True)",
+            "            print(f'[DEBUG] STDERR: {stderr}', file=sys.stderr , flush=True)",
+            "            print(f'[DEBUG] EXIT CODE: {exit_code}', file=sys.stderr , flush=True)",
+            "",
+            "            if exit_code == 42:",
+            "                self._test_error_type = 'SECURITY_VIOLATION'",
+            "                try:",
+            "                    first_json_line = next((line for line in stderr.splitlines() if line.strip().startswith('{')), None)",
+            "                    if first_json_line:",
+            "                        error_data = json.loads(first_json_line)",
+            "                        self._test_error = error_data.get('message', 'Нарушение политики безопасности')",
+            "                        self._test_traceback = error_data.get('traceback', '')",
+            "                    else:",
+            "                        self._test_error = 'Нарушение политики безопасности'",
+            "                except Exception:",
+            "                    self._test_error = 'Нарушение политики безопасности'",
+            "                raise RuntimeError(self._test_error)",
+            "",
+            "            if exit_code == 2:",
+            "                self._test_error_type = 'MAIN_NOT_FOUND'",
+            "                self._test_error = 'main.py не найден или не запускается'",
+            "                self._test_traceback = stderr",
+            "                raise RuntimeError(self._test_error)",
+            "",
+            "            if exit_code != 0:",
+            "                self._test_error_type = 'NON_ZERO_EXIT'",
+            "                self._test_error = f'Код выхода: {exit_code}. STDERR: {stderr}'",
+            "                self._test_traceback = f'Вывод STDOUT: {stdout}\\nВывод STDERR: {stderr}'",
+            "                raise RuntimeError(self._test_error)",
+            "",
+            "            try:",
+            "                first_json_line = next((line for line in stderr.splitlines() if line.strip().startswith('{')), None)",
+            "                if first_json_line:",
+            "                    error_data = json.loads(first_json_line)",
+            "                    self._test_error_type = error_data.get('type', 'UNKNOWN_ERROR')",
+            "                    self._test_error = error_data.get('message', 'Неизвестная ошибка')",
+            "                    self._test_traceback = error_data.get('traceback', '')",
+            "                    raise RuntimeError(self._test_error)",
+            "            except Exception:",
+            "                pass",
+            "",
+            "            try:",
+            "                stdout_lines = stdout.splitlines()",
+            "                last_line = stdout_lines[-1] if stdout_lines else ''",
+            "                print(f'[DEBUG] RAW STDOUT: {stdout!r}', file=sys.stderr, flush=True)",
+            "                result = json.loads(last_line)",
+            "                self.assertEqual(result, expected)",
+            "            except json.JSONDecodeError:",
+            "                self._test_error_type = 'INVALID_OUTPUT'",
+            "                self._test_error = f'Некорректный JSON вывод: {stdout}'",
+            "                raise",
+            "",
+            "        except subprocess.TimeoutExpired:",
+            "            proc.kill()",
+            "            out, err = proc.communicate()",
+            "            self._test_error_type = 'TIMEOUT'",
+            "            self._test_error = f'Тест превысил лимит времени ({timeout} сек)'",
+            "            self._test_traceback = err.decode().strip()",
+            "        except AssertionError as ae:",
+            "            self._test_error_type = 'ASSERTION_ERROR'",
+            "            self._test_error = str(ae)",
+            "            self._test_traceback = traceback.format_exc()",
+            "        except Exception as e:",
+            "            if not self._test_error_type:",
+            "                self._test_error_type = 'RUNTIME_ERROR'",
+            "                self._test_error = str(e)",
+            "                self._test_traceback = traceback.format_exc()",
+            "",
+            "        if self._test_error:",
+            "            self.fail(self._test_error)",
+            "",
             *test_cases,
             "",
             "class CustomTestResult(unittest.TextTestResult):",
@@ -435,8 +610,5 @@ if __name__ == "__main__":
             "            'traceback': tb",
             "        })",
             "",
-            "    print(json.dumps(output))"
+            "    print(json.dumps(output), file=sys.stdout, flush=True)"
         ])
-
-
-
