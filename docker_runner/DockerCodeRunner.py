@@ -118,29 +118,51 @@ class DockerCodeRunner:
 
 
     def generate_allowed_modules_script(self, libraries):
-        allowed_list = ', '.join(f'"{lib}"' for lib in libraries)
-        return f"""\
+        return f'''\
 import json
-import importlib.metadata as m
+import sys
+import pkgutil
+import importlib
+import subprocess
 
-allowed = [{allowed_list}]
-allowed = set(x.lower() for x in allowed)
-deps = set()
+allowed = set()
 
-for dist in m.distributions():
-    name = dist.metadata.get("Name")
-    if not name:
-        continue
-    name = name.lower()
-    if name in allowed:
-        requires = dist.requires or []
-        for r in requires:
-            deps.add(r.split()[0].lower())
-        deps.add(name)
+# Встроенные модули
+allowed |= set(sys.builtin_module_names)
 
+# Модули из pip
+try:
+    output = subprocess.check_output(["pip", "list", "--format=json"], text=True)
+    installed = json.loads(output)
+    package_names = [pkg["name"] for pkg in installed]
+    for pkg in package_names:
+        try:
+            module = importlib.import_module(pkg)
+            allowed.add(pkg.lower())
+            if hasattr(module, "__path__"):
+                for _, name, _ in pkgutil.walk_packages(module.__path__, module.__name__ + "."):
+                    allowed.add(name.split(".")[0])
+        except Exception:
+            continue
+except Exception:
+    pass
+
+# Добавим стандартные модули, сканируя sys.path
+for finder, name, _ in pkgutil.iter_modules():
+    allowed.add(name)
+
+# Удалим возможные пустые или приватные
+allowed = {{x for x in allowed if x and not x.startswith("_")}}
+
+# Сохраняем
 with open("/allowed_modules.json", "w", encoding="utf-8") as f:
-    json.dump(sorted(deps), f)
-"""
+    json.dump(sorted(allowed), f)
+
+
+'''
+
+
+
 
 
     def _write_file(self, path, content):
