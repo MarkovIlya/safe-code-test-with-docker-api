@@ -230,7 +230,7 @@ with open("/allowed_modules.json", "w", encoding="utf-8") as f:
             raise Exception(f"Ошибка установки библиотек:\n{decoded_output}")
         return decoded_output
     
-    def _extract_function_name(self, code: str) -> str:
+    def _extract_function_name(self, code):
         tree = ast.parse(code)
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
@@ -275,7 +275,7 @@ with open("/allowed_modules.json", "w", encoding="utf-8") as f:
 
         raise Exception(f"Функция с именем '{function_name}' не найдена в коде участника.")
 
-    def _load_allowed_modules_from_image(self, image_name: str) -> list[str]:
+    def _load_allowed_modules_from_image(self, image_name):
         """
         Извлекает /allowed_modules.json из образа и возвращает список модулей.
         """
@@ -381,7 +381,7 @@ with open("/allowed_modules.json", "w", encoding="utf-8") as f:
             }
     
 
-    def _load_allowed_modules_from_container(self, container_id: str):
+    def _load_allowed_modules_from_container(self, container_id):
         command = ["docker", "exec", container_id, "cat", "/allowed_modules.json"]
         output = subprocess.check_output(command)
         if not output.strip():
@@ -389,7 +389,7 @@ with open("/allowed_modules.json", "w", encoding="utf-8") as f:
         return json.loads(output.decode("utf-8"))
 
 
-    def _generate_main(self, user_code: str, func_name: str, allowed_modules: list[str]) -> str:
+    def _generate_main(self, user_code, func_name, allowed_modules):
         return textwrap.dedent(f"""
 import sys
 import json
@@ -410,7 +410,7 @@ except Exception as e:
     sys.exit(42)
 
 # Функция извлечения имени модуля
-def extract_module_name(name: str) -> str:
+def extract_module_name(name):
     return name.split('>=')[0].split('==')[0].split('<=')[0].strip()
 
 # Модули, разрешённые по умолчанию и через зависимые библиотеки
@@ -446,7 +446,7 @@ def is_trusted_module(frame):
     return False
 
 # Аудит-хук для контроля событий безопасности
-def audit_hook(event: str, args):
+def audit_hook(event, args):
     if event in ('compile', 'exec'):
         trusted = False
         for i in range(10):
