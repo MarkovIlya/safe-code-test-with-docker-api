@@ -8,9 +8,7 @@ import logging
 import ast
 import json
 import textwrap
-import base64
 import subprocess
-
 
 class DockerCodeRunner:
     def __init__(self):
@@ -196,13 +194,6 @@ allowed = {{x for x in allowed if x}}
 with open("/allowed_modules.json", "w", encoding="utf-8") as f:
     json.dump(sorted(allowed), f, ensure_ascii=False)
 '''
-
-
-
-
-
-
-
 
     def _write_file(self, path, content):
         with open(path, "w", encoding="utf-8") as f:
@@ -438,7 +429,7 @@ BLACKLIST = {{
     'os', 'subprocess', 'socket', 'threading', 'multiprocessing',
     'signal', 'shutil', 'sysconfig', 'requests', 'urllib',
     'inspect', 'compileall'
-}}
+}} 
 
 # Проверка, является ли фрейм доверенным (например, из разрешённой библиотеки)
 def is_trusted_module(frame):
@@ -500,6 +491,9 @@ def block_builtin(name):
         raise SecurityViolation(f"Использование {{name}} запрещено")
     return wrapper
 
+# Пробежаться по BLACKLIST и удалить каждый модуль из sys.modules(), а после удалить sys
+# Закешировать sys.exit
+
 # Вставка пользовательского кода
 {user_code.strip()}
 
@@ -549,11 +543,6 @@ if __name__ == "__main__":
         sys.exit(1)
 """)
 
-
-
-
-
-
     def _generate_tests(self, tests, timeout_sec=2):
         test_cases = []
         for idx, test in enumerate(tests):
@@ -580,7 +569,7 @@ if __name__ == "__main__":
             "        self._test_error_type = None",
             "        self._test_traceback = None",
             "        try:",
-            "            command = ['python3', '/mnt/app/main.py'] + list(args)",
+            "            command = ['python3', '/mnt/app/main.py'] + list(args)", # Создать списки whitelist и blacklist
             "            proc = subprocess.Popen(",
             "                command,",
             "                stdout=subprocess.PIPE,",
