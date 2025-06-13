@@ -30,6 +30,7 @@ class DockerCodeRunner:
 
         temp_dir = tempfile.mkdtemp()
         container_dir = '/mnt/app'
+        container = None
         self.logger.debug(f"Создана временная директория: {temp_dir}")
 
         try:
@@ -79,7 +80,7 @@ class DockerCodeRunner:
                 return self._parse_test_results(stdout, stderr, exit_code, install_output)
 
             finally:
-                if cleanup:
+                if cleanup and container:
                     self._cleanup_container(container)
 
         except Exception as e:
@@ -201,6 +202,15 @@ with open("/allowed_modules.json", "w", encoding="utf-8") as f:
         self.logger.debug(f"Сохранён файл {path}:\n{content}")
 
     def _start_container(self, image_name):
+        try:
+            self.client.images.get(image_name)
+        except docker.errors.ImageNotFound:
+            self.logger.error(f"Образ {image_name} не найден.")
+            raise Exception(f"Образ {image_name} не найден. Сначала создайте его через /image/build.")
+        except docker.errors.APIError as e:
+            self.logger.error(f"Ошибка при обращении к Docker API: {str(e)}")
+            raise Exception(f"Ошибка Docker API: {str(e)}")
+
         container = self.client.containers.run(
             image=image_name,
             command="sleep infinity",
