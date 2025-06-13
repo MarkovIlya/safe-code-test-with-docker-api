@@ -22,16 +22,16 @@
 git clone git@github.com:MarkovIlya/safe-code-test-with-docker-api.git
 ```
 
-2. Установи зависимости:
-
-```bash
-pip install -r requirements.txt
-```
-
-3. Активируй виртуальное окружение:
+2. Активируй виртуальное окружение:
 
 ```bash
 source venv/bin/activate
+```
+
+3. Установи зависимости:
+
+```bash
+pip install -r requirements.txt
 ```
 
 4. Запусти API в корне проекта:
