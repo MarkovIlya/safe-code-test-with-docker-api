@@ -28,7 +28,13 @@ git clone git@github.com:MarkovIlya/safe-code-test-with-docker-api.git
 pip install -r requirements.txt
 ```
 
-3. Запусти API в корне проекта:
+3. Активируй виртуальное окружение:
+
+```bash
+source venv/bin/activate
+```
+
+4. Запусти API в корне проекта:
 
 ```bash
 gunicorn main:app -c gunicorn.conf.py
