@@ -556,9 +556,8 @@ if __name__ == "__main__":
     def _generate_tests(self, tests, timeout_sec=2):
         test_cases = []
         for idx, test in enumerate(tests):
-            params_list = [json.dumps(p) for p in test["parameters"]]
-            params = ", ".join(repr(p) for p in params_list)
-            expected = str(test["results"][0])
+            params = "*[" + ", ".join(json.dumps(p) for p in test["parameters"]) + "]"
+            expected = repr(test["results"][0])
             test_id = test.get("id", f"{idx + 1}")
 
             test_cases.append(
@@ -579,7 +578,7 @@ if __name__ == "__main__":
             "        self._test_error_type = None",
             "        self._test_traceback = None",
             "        try:",
-            "            command = ['python3', '/mnt/app/main.py'] + list(args)", # Создать списки whitelist и blacklist
+            "            command = ['python3', '/mnt/app/main.py'] + [str(arg) for arg in args]", # Создать списки whitelist и blacklist
             "            proc = subprocess.Popen(",
             "                command,",
             "                stdout=subprocess.PIPE,",
